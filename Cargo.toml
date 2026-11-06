@@ -1,0 +1,33 @@
+[package]
+name = "account-sponsor"
+description = "Sponsors creation of NEAR accounts (named, implicit, NEP-616 deterministic, NEP-655 universal) for wallet connectors, callable through a public function-call access key"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/frol-ai/near-account-sponsor"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = { version = "5.30.1", features = ["deterministic-account-ids", "universal-accounts"] }
+
+[dev-dependencies]
+near-sdk = { version = "5.30.1", features = ["deterministic-account-ids", "universal-accounts", "unit-testing"] }
+near-workspaces = { version = "0.24.0", features = ["unstable"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde_json = "1"
+anyhow = "1"
+base64 = "0.22"
+bs58 = "0.5"
+
+[workspace]
+members = ["registrar-mock"]
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true

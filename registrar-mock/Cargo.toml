@@ -1,0 +1,12 @@
+[package]
+name = "registrar-mock"
+description = "Test-only stand-in for the `near` registrar: create_account(new_account_id, new_public_key)"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+near-sdk = "5.30.1"
