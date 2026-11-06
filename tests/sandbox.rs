@@ -7,8 +7,8 @@ use near_sdk::universal_state_init::{UniversalStateInit, UniversalStateInitV1};
 use near_sdk::GlobalContractId;
 use near_workspaces::network::Sandbox;
 use near_workspaces::result::ExecutionFinalResult;
-use near_workspaces::types::{AccessKey, ContractState, Gas, KeyType, NearToken, SecretKey};
-use near_workspaces::{Account, AccountId, Worker};
+use near_workspaces::types::{AccessKey, Gas, KeyType, NearToken, SecretKey};
+use near_workspaces::{Account, AccountId, ContractState, Worker};
 use serde_json::json;
 
 const PUBLIC_METHODS: [&str; 5] = [
@@ -18,6 +18,23 @@ const PUBLIC_METHODS: [&str; 5] = [
     "create_universal_account",
     "relay_execute_signed",
 ];
+
+/// Both contracts, compiled once per test run: concurrent `cargo near`
+/// builds of the same crate race on the output file.
+async fn wasms() -> &'static (Vec<u8>, Vec<u8>) {
+    static WASMS: tokio::sync::OnceCell<(Vec<u8>, Vec<u8>)> = tokio::sync::OnceCell::const_new();
+    WASMS
+        .get_or_init(|| async {
+            let sponsor = near_workspaces::compile_project("./")
+                .await
+                .expect("build sponsor");
+            let registrar = near_workspaces::compile_project("./registrar-mock")
+                .await
+                .expect("build registrar-mock");
+            (sponsor, registrar)
+        })
+        .await
+}
 
 struct Env {
     worker: Worker<Sandbox>,
@@ -31,8 +48,7 @@ struct Env {
 
 async fn setup(max_accounts_per_window: u32) -> anyhow::Result<Env> {
     let worker = near_workspaces::sandbox().await?;
-    let sponsor_wasm = near_workspaces::compile_project("./").await?;
-    let registrar_wasm = near_workspaces::compile_project("./registrar-mock").await?;
+    let (sponsor_wasm, registrar_wasm) = wasms().await;
     let root = worker.root_account()?;
 
     let registrar = root
@@ -41,11 +57,11 @@ async fn setup(max_accounts_per_window: u32) -> anyhow::Result<Env> {
         .transact()
         .await?
         .into_result()?;
-    registrar.deploy(&registrar_wasm).await?.into_result()?;
+    registrar.deploy(registrar_wasm).await?.into_result()?;
     // Publish the mock's code as a global contract identified by this account.
     registrar
         .call(registrar.id(), "deploy_global_by_account_id")
-        .args_json(json!({ "code": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &registrar_wasm) }))
+        .args_json(json!({ "code": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, registrar_wasm) }))
         .max_gas()
         .transact()
         .await?
@@ -57,7 +73,7 @@ async fn setup(max_accounts_per_window: u32) -> anyhow::Result<Env> {
         .transact()
         .await?
         .into_result()?;
-    sponsor.deploy(&sponsor_wasm).await?.into_result()?;
+    sponsor.deploy(sponsor_wasm).await?.into_result()?;
     sponsor
         .call(sponsor.id(), "new")
         .args_json(json!({
@@ -218,9 +234,13 @@ async fn creates_all_four_kinds_through_the_public_key() -> anyhow::Result<()> {
         ContractState::GlobalAccountId(env.registrar.id().clone())
     );
 
-    // The public key's allowance paid the gas; the contract balance only
-    // grew by its share of gas rewards and did not fund any account.
-    assert!(env.sponsor_balance().await? >= balance_before);
+    // The sponsor's balance paid only gas for the five calls (a function-call
+    // key's allowance caps that spend; it doesn't pay it), no deposits.
+    let spent = balance_before.as_yoctonear() - env.sponsor_balance().await?.as_yoctonear();
+    assert!(
+        spent < NearToken::from_millinear(50).as_yoctonear(),
+        "spent {spent} yoctoNEAR"
+    );
     Ok(())
 }
 

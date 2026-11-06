@@ -11,7 +11,8 @@
 //! its own balance on the new accounts (NEAR's zero-balance accounts cover
 //! small accounts). Relays attach exactly 1 yoctoNEAR, which the wallet
 //! contract's `w_execute_signed` requires. What a public key can abuse is
-//! therefore limited to gas, which the access key's allowance caps, and to the
+//! therefore limited to gas (paid from the sponsor's balance, capped in total
+//! by the access key's allowance), and to the
 //! number of accounts and relays, which rate limits cap. Deterministic and
 //! universal accounts may only run contract code from an owner-managed
 //! allowlist.
@@ -25,7 +26,7 @@ use near_sdk::state_init::StateInit;
 use near_sdk::universal_state_init::{RawStateInit, UniversalStateInit};
 use near_sdk::{
     assert_one_yocto, env, near, require, serde_json, AccountId, Gas, GasWeight, GlobalContractId,
-    NearToken, Promise, PublicKey,
+    NearToken, PanicOnDefault, Promise, PublicKey,
 };
 
 /// Gas forwarded to `<registrar>.create_account`. The mainnet `near`
@@ -68,6 +69,7 @@ impl Window {
 }
 
 #[near(contract_state)]
+#[derive(PanicOnDefault)]
 pub struct Contract {
     /// Account allowed to change the configuration (with 1 yoctoNEAR attached).
     owner_id: AccountId,

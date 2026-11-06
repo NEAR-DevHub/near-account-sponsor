@@ -45,8 +45,9 @@ sponsor account with 0 deposit, which a relayer then submits.
 - **No deposits.** Every account is created with 0 NEAR (zero-balance
   accounts). The contract never spends its own balance on new accounts; each
   relay costs it 1 yoctoNEAR.
-- **Gas.** Paid from the public key's allowance. When it runs out, the
-  operator adds a new key or a larger allowance.
+- **Gas.** Paid from the sponsor account's balance, like any transaction it
+  signs. The public key's allowance caps how much gas it can ever spend; when
+  it runs out, the operator adds a new key or a larger allowance.
 - **Named accounts** must be direct sub-accounts of the registrar
   (`alice.near`, not `team.alice.near` or `alice.tg`).
 - **Code allowlist.** Deterministic accounts, and universal accounts with code,
@@ -142,6 +143,11 @@ near account add-key helper.trezu.near grant-function-call-access \
 cargo test --lib          # unit tests
 cargo test --test sandbox # neard 2.14 sandbox; builds the contract and the registrar mock
 ```
+
+The sandbox tests download neard 2.14 at build time. To use a binary you
+already have, set `NEAR_SANDBOX_BIN_PATH`. The macOS build links Homebrew's
+`liblzma`; without Homebrew, point `NEAR_SANDBOX_BIN_PATH` at a wrapper script
+that runs the binary with `DYLD_LIBRARY_PATH=/usr/lib`.
 
 The sandbox tests call the contract through a function-call key, create all
 four kinds of accounts, relay `w_execute_signed` to deterministic and universal

@@ -38,7 +38,7 @@ impl Registrar {
     /// Wallet-contract stub: requires 1 yoctoNEAR like the real one and logs
     /// what it received.
     #[payable]
-    pub fn w_execute_signed(&self, msg: serde_json::Value, proof: String) {
+    pub fn w_execute_signed(&mut self, msg: serde_json::Value, proof: String) {
         assert_one_yocto();
         env::log_str(&format!("w_execute_signed proof={proof} msg={msg}"));
     }
