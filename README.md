@@ -20,21 +20,25 @@ All four return the promise, so a failed creation fails the transaction.
 
 ### Relaying `w_execute_signed`
 
-`relay_execute_signed(wallet_id, msg, proof, state_init?)` calls
-`w_execute_signed({ msg, proof })` on a wallet account with **1 yoctoNEAR**
-(paid by the contract, as the wallet contract requires) and all remaining
-gas. It replaces the transactions the passkey and EIP-712 connectors used to
-sign with the sponsor's full-access key (`[StateInit?, FunctionCall
-w_execute_signed]` sent to the wallet account).
+`relay_execute_signed(state_init, args)` calls `w_execute_signed` on a wallet
+account with **1 yoctoNEAR** (paid by the contract, as the wallet contract
+requires) and all remaining gas. It replaces the transactions the passkey and
+EIP-712 connectors used to sign with the sponsor's full-access key
+(`[StateInit?, FunctionCall w_execute_signed]` sent to the wallet account).
 
-- `wallet_id` must be a deterministic (`0s…`) or universal (`0u…`) account, so
-  the relay can't be pointed at arbitrary named contracts.
-- `state_init` (optional) initializes a wallet that doesn't exist yet in the
-  same receipt: `{"deterministic": <StateInit>}` or `{"universal": "<base64>"}`.
-  It must derive to `wallet_id` and use allowlisted code.
-- `msg` and `proof` are forwarded unchanged; the wallet contract checks the
-  signature.
+- `state_init` is **required**: `{"deterministic": <StateInit>}` or
+  `{"universal": "<base64>"}`. The wallet account id is derived from it, and
+  its code must be on the allowlist (a universal state init must carry code),
+  so a relay can only ever reach a wallet running allowlisted code. The state
+  init is attached to every relay: it creates the wallet if needed and is a
+  no-op on an existing wallet (its storage is left alone; the sandbox tests
+  check this).
+- `args` is the base64 of the `w_execute_signed` JSON arguments
+  (`{"msg": …, "proof": …}`), forwarded byte for byte, so the signed message
+  reaches the wallet exactly as the client built it. The wallet contract
+  checks the signature.
 - Attach enough gas for the wallet's own work (the connectors use 300 TGas).
+  The promise resolves to the wallet's result.
 
 NEP-366 delegate actions keep working: the public key can sign a delegate
 action whose only action is a `FunctionCall` to `relay_execute_signed` on the
@@ -56,12 +60,21 @@ sponsor account with 0 deposit, which a relayer then submits.
 - **Rate limits.** Per `window_secs`: at most `max_accounts_per_window`
   accounts (all kinds together) and, separately, at most
   `max_relays_per_window` relays.
+- **Own keys only.** The public methods only accept calls signed with the
+  sponsor account's own keys (predecessor = the sponsor), so other accounts and
+  contracts can't use the sponsor without going through the key's allowance.
 - **Admin methods** (`add_allowed_code`, `remove_allowed_code`,
-  `set_rate_limits`, `set_owner`) require the owner as predecessor **and**
+  `set_rate_limits`, `propose_owner`) require the owner as predecessor **and**
   exactly 1 yoctoNEAR. Function-call keys can't attach deposits, so the public
-  key can't call them even if its method list were wrong.
+  key can't call them even if its method list were wrong. Ownership moves in
+  two steps: `propose_owner`, then `accept_owner` from the new owner (also with
+  1 yoctoNEAR).
+- **Pausing.** `set_rate_limits` with a maximum of 0 stops that kind of
+  operation until it is raised again.
 
-Each creation logs an NEP-297 event:
+Each creation logs an NEP-297 event (relays log `relay_requested`; admin
+changes log `allowed_code_added`, `allowed_code_removed`, `rate_limits_set`,
+`owner_proposed` and `owner_changed`):
 
 ```
 EVENT_JSON:{"standard":"account_sponsor","version":"1.0.0","event":"account_requested","data":[{"kind":"named","account_id":"alice.near"}]}
@@ -85,11 +98,13 @@ Sign a transaction from `helper.trezu.near` with the public key, receiver
 // create_universal_account — borsh UniversalStateInit, base64; forwarded byte for byte
 { "state_init": "<base64>" }
 
-// relay_execute_signed — attach 300 TGas; state_init only when the wallet doesn't exist yet
-{ "wallet_id": "0s…", "msg": { … }, "proof": "…", "state_init": { "deterministic": { "V1": { … } } } }
+// relay_execute_signed — attach 300 TGas; args = base64('{"msg":…,"proof":…}')
+{ "state_init": { "deterministic": { "V1": { … } } }, "args": "<base64>" }
 ```
 
-Each relay logs a `relay_requested` event with the wallet account id.
+Each relay logs a `relay_requested` event with the wallet account id. Sign
+these transactions from the sponsor account with the public key: calls from any
+other account are refused.
 
 `get_config()` returns the owner, registrar, allowlist, limits and how many
 accounts and relays are left in the current window.
@@ -150,10 +165,42 @@ already have, set `NEAR_SANDBOX_BIN_PATH`. The macOS build links Homebrew's
 that runs the binary with `DYLD_LIBRARY_PATH=/usr/lib`.
 
 The sandbox tests call the contract through a function-call key, create all
-four kinds of accounts, relay `w_execute_signed` to deterministic and universal
-wallets (with and without state init), and check the refusals: deeper named
-accounts, codes not on the allowlist, relays to named accounts or with a
-mismatched state init, admin calls through function-call keys, and the rate
-limit. `registrar-mock/` is a test-only contract: a stand-in for the `near`
+four kinds of accounts, relay `w_execute_signed` to new and existing
+deterministic and universal wallets (checking that a repeated state init keeps
+the wallet's storage), and check the refusals: deeper named accounts, codes
+not on the allowlist (for creation and relays), calls from other accounts,
+admin calls through function-call keys, and the rate limit. `registrar-mock/` is a test-only contract: a stand-in for the `near`
 registrar that can also publish a global contract, and a `w_execute_signed`
 stub for relays.
+
+## Security notes
+
+Audit findings that the contract addresses:
+
+- **Relay targets run allowlisted code.** The wallet id is derived from the
+  required state init, so the sponsor never calls code nobody vetted, and it
+  can't be used to send 1 yoctoNEAR calls to arbitrary accounts.
+- **Relayed arguments are not re-encoded.** They are forwarded byte for byte,
+  so numbers beyond 64 bits, key order and string escapes survive.
+- **No use from other accounts.** Public methods require predecessor = the
+  sponsor account.
+- **Admin is owner + 1 yoctoNEAR**, with two-step ownership transfer and
+  events for every change.
+
+Risks that remain by design, and how to handle them:
+
+- **The public key is public.** Anyone can use up the rate limits (blocking
+  onboarding until the window resets) or the key's gas allowance. Keep the
+  allowance modest, watch `get_config` and the events, and add a new key or
+  adjust limits when needed. Each relay to a valid wallet with an invalid
+  proof still costs gas; allowlisted wallet code rejects such calls early.
+- **Named accounts can be claimed for free**, within the rate limit. If that
+  matters, keep `max_accounts_per_window` low or create named accounts from a
+  backend instead.
+- **Failed attempts count.** A rate-limit slot is taken before the creation or
+  relay receipt runs, even if it later fails.
+- **Allowlisting by account id trusts that account's future upgrades** (the
+  account can redeploy its global code). Allowlist by code hash
+  (`{"hash": "<base58>"}`) to pin exact code.
+- **Upgrades.** The contract has no migration method; deploying a new version
+  with a different state layout needs one.

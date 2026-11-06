@@ -345,28 +345,34 @@ async fn rate_limit_caps_creations() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn relay_args(proof: &str) -> String {
+    let args = json!({ "msg": { "signer_id": "wallet", "nonce": 7 }, "proof": proof }).to_string();
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, args)
+}
+
 #[tokio::test]
 async fn relays_w_execute_signed_to_wallet_accounts() -> anyhow::Result<()> {
     let env = setup(10).await?;
-    let msg = json!({ "signer_id": "wallet", "nonce": 7 });
 
-    // Deterministic wallet that doesn't exist yet: initialized in the relay.
-    let state_init =
-        StateInit::V1(StateInitV1::code(env.code()).with_data_entry(b"pk".to_vec(), b"1".to_vec()));
+    // Deterministic wallet that doesn't exist yet: created by the relay.
+    let state_init = StateInit::V1(
+        StateInitV1::code(env.code()).with_data_entry(b"pk".to_vec(), b"seed".to_vec()),
+    );
     let wallet: AccountId = state_init.derive_account_id().as_str().parse()?;
     assert!(!env.exists(&wallet).await);
-    let result = env
-        .call(
+    let relay = |proof: &'static str| {
+        env.call(
             "relay_execute_signed",
-            json!({ "wallet_id": wallet, "msg": msg, "proof": "p1", "state_init": { "deterministic": state_init } }),
+            json!({ "state_init": { "deterministic": state_init }, "args": relay_args(proof) }),
         )
-        .await?;
+    };
+    let result = relay("p1").await?;
     assert!(result.is_success(), "{:?}", result.clone().into_result());
     assert!(
         result
             .logs()
             .iter()
-            .any(|l| l.contains("w_execute_signed proof=p1")),
+            .any(|l| l.contains(r#"w_execute_signed proof=p1 prev_pk=Some("seed")"#)),
         "{:?}",
         result.logs()
     );
@@ -376,27 +382,26 @@ async fn relays_w_execute_signed_to_wallet_accounts() -> anyhow::Result<()> {
         ContractState::GlobalAccountId(env.registrar.id().clone())
     );
 
-    // Same wallet, now existing: no state init needed.
-    let result = env
-        .call(
-            "relay_execute_signed",
-            json!({ "wallet_id": wallet, "msg": msg, "proof": "p2" }),
-        )
-        .await?;
+    // Same wallet, now existing: the repeated state init is a no-op and leaves
+    // the wallet's storage alone (it sees what the first call wrote).
+    let result = relay("p2").await?;
     assert!(result.is_success(), "{:?}", result.clone().into_result());
-    assert!(result
-        .logs()
-        .iter()
-        .any(|l| l.contains("w_execute_signed proof=p2")));
+    assert!(
+        result
+            .logs()
+            .iter()
+            .any(|l| l.contains(r#"w_execute_signed proof=p2 prev_pk=Some("p1")"#)),
+        "{:?}",
+        result.logs()
+    );
 
-    // Universal wallet with code, initialized in the relay.
+    // Universal wallet with code.
     let raw =
         UniversalStateInit::V1(UniversalStateInitV1::default().with_code(env.code())).to_raw();
-    let universal: AccountId = raw.try_derive_account_id().unwrap().as_str().parse()?;
     let result = env
         .call(
             "relay_execute_signed",
-            json!({ "wallet_id": universal, "msg": msg, "proof": "p3", "state_init": { "universal": raw } }),
+            json!({ "state_init": { "universal": raw }, "args": relay_args("p3") }),
         )
         .await?;
     assert!(result.is_success(), "{:?}", result.clone().into_result());
@@ -405,25 +410,17 @@ async fn relays_w_execute_signed_to_wallet_accounts() -> anyhow::Result<()> {
         .iter()
         .any(|l| l.contains("w_execute_signed proof=p3")));
 
-    // A named contract with the same method is refused.
+    // A wallet running code that isn't on the allowlist is refused.
+    let other = StateInit::V1(StateInitV1::code(GlobalContractId::AccountId(
+        "evil.test.near".parse().unwrap(),
+    )));
     let result = env
         .call(
             "relay_execute_signed",
-            json!({ "wallet_id": env.registrar.id(), "msg": msg, "proof": "p4" }),
+            json!({ "state_init": { "deterministic": other }, "args": relay_args("p4") }),
         )
         .await?;
-    assert_failure(&result, "Relays only go to deterministic");
-
-    // state_init for a different account is refused.
-    let other =
-        StateInit::V1(StateInitV1::code(env.code()).with_data_entry(b"pk".to_vec(), b"2".to_vec()));
-    let result = env
-        .call(
-            "relay_execute_signed",
-            json!({ "wallet_id": wallet, "msg": msg, "proof": "p5", "state_init": { "deterministic": other } }),
-        )
-        .await?;
-    assert_failure(&result, "state_init does not derive to wallet_id");
+    assert_failure(&result, "not on the sponsor's allowlist");
 
     let config: serde_json::Value = env
         .sponsor
@@ -432,5 +429,22 @@ async fn relays_w_execute_signed_to_wallet_accounts() -> anyhow::Result<()> {
         .json()?;
     assert_eq!(config["remaining_relays_in_window"], 7);
     assert_eq!(config["remaining_accounts_in_window"], 10);
+    Ok(())
+}
+
+#[tokio::test]
+async fn other_accounts_cannot_use_the_sponsor() -> anyhow::Result<()> {
+    let env = setup(10).await?;
+    let outsider = env.worker.dev_create_account().await?;
+    let (_, hex) = random_ed25519();
+    let result = outsider
+        .call(env.sponsor.id(), "create_implicit_account")
+        .args_json(json!({ "account_id": hex }))
+        .transact()
+        .await?;
+    assert_failure(
+        &result,
+        "Only callable with the sponsor account's own access keys",
+    );
     Ok(())
 }

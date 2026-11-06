@@ -12,16 +12,20 @@
 //! small accounts). Relays attach exactly 1 yoctoNEAR, which the wallet
 //! contract's `w_execute_signed` requires. What a public key can abuse is
 //! therefore limited to gas (paid from the sponsor's balance, capped in total
-//! by the access key's allowance), and to the
-//! number of accounts and relays, which rate limits cap. Deterministic and
-//! universal accounts may only run contract code from an owner-managed
+//! by the access key's allowance), and to the number of accounts and relays,
+//! which rate limits cap. Deterministic and universal accounts — including
+//! every relay target — may only run contract code from an owner-managed
 //! allowlist.
+//!
+//! The public methods only accept calls signed with the sponsor's own access
+//! keys (predecessor = this account), so nobody can use the sponsor from
+//! another contract or account without going through the key's allowance.
 //!
 //! Admin methods require the owner as predecessor *and* exactly 1 yoctoNEAR
 //! attached. Function-call access keys cannot attach a deposit, so the public
 //! key can never call them, even if its method list were misconfigured.
 
-use near_sdk::json_types::U64;
+use near_sdk::json_types::{Base64VecU8, U64};
 use near_sdk::state_init::StateInit;
 use near_sdk::universal_state_init::{RawStateInit, UniversalStateInit};
 use near_sdk::{
@@ -73,6 +77,8 @@ impl Window {
 pub struct Contract {
     /// Account allowed to change the configuration (with 1 yoctoNEAR attached).
     owner_id: AccountId,
+    /// Proposed new owner; ownership moves once it calls `accept_owner`.
+    pending_owner_id: Option<AccountId>,
     /// Account whose `create_account` method creates named accounts
     /// (`near` on mainnet, `testnet` on testnet). Only direct sub-accounts
     /// of it (`<name>.<registrar>`) can be requested.
@@ -89,9 +95,9 @@ pub struct Contract {
     relays: Window,
 }
 
-/// State init for a wallet account that may not exist yet, sent along with a
-/// relayed call (JSON: `{"deterministic": <StateInit>}` or
-/// `{"universal": "<base64 borsh>"}`).
+/// State init of the wallet account a relay goes to (JSON:
+/// `{"deterministic": <StateInit>}` or `{"universal": "<base64 borsh>"}`).
+/// The wallet account id is derived from it.
 #[near(serializers = [json])]
 #[serde(rename_all = "snake_case")]
 pub enum WalletStateInit {
@@ -105,6 +111,7 @@ pub enum WalletStateInit {
 #[near(serializers = [json])]
 pub struct Config {
     pub owner_id: AccountId,
+    pub pending_owner_id: Option<AccountId>,
     pub registrar_id: AccountId,
     pub allowed_codes: Vec<GlobalContractId>,
     pub window_secs: U64,
@@ -131,6 +138,7 @@ impl Contract {
         require!(window_secs.0 > 0, "window_secs must be positive");
         Self {
             owner_id,
+            pending_owner_id: None,
             registrar_id,
             allowed_codes,
             window_ns: secs_to_ns(window_secs.0),
@@ -151,6 +159,7 @@ impl Contract {
         account_id: AccountId,
         public_key: PublicKey,
     ) -> Promise {
+        require_own_key();
         require!(
             account_id.get_parent_account_id() == Some(self.registrar_id.as_ref()),
             format!(
@@ -174,6 +183,7 @@ impl Contract {
     /// account by sending it 0 NEAR. The account is controlled by the key
     /// (or Ethereum address) its id is derived from.
     pub fn create_implicit_account(&mut self, account_id: AccountId) -> Promise {
+        require_own_key();
         require!(
             is_implicit(&account_id),
             "Expected a NEAR-implicit (64 hex) or ETH-implicit (0x + 40 hex) account id"
@@ -186,6 +196,7 @@ impl Contract {
     /// Creates the NEP-616 deterministic (`0s…`) account for `state_init`
     /// (no deposit). The code must be on the allowlist.
     pub fn create_deterministic_account(&mut self, state_init: StateInit) -> Promise {
+        require_own_key();
         let account_id = self.check_deterministic(&state_init);
         self.take_account();
         emit("account_requested", "deterministic", &account_id);
@@ -198,6 +209,7 @@ impl Contract {
     /// allowlist. An account with neither code nor keys is refused, as nobody
     /// could ever control it.
     pub fn create_universal_account(&mut self, state_init: RawStateInit) -> Promise {
+        require_own_key();
         let (account_id, decoded) = decode_universal(&state_init);
         match decoded.code() {
             Some(code) => self.require_allowed_code(code),
@@ -213,50 +225,43 @@ impl Contract {
 
     // ─── Wallet-contract relay (public key) ─────────────────────────────────
 
-    /// Calls `w_execute_signed({ msg, proof })` on a deterministic (`0s…`) or
-    /// universal (`0u…`) wallet account with 1 yoctoNEAR (paid by this
-    /// contract) and all remaining gas. With `state_init`, the wallet account
-    /// is initialized in the same receipt first; it must derive to
-    /// `wallet_id` and run allowlisted code.
+    /// Calls `w_execute_signed` on the wallet account derived from
+    /// `state_init`, with 1 yoctoNEAR (paid by this contract) and all remaining
+    /// gas. The state init is always attached: it creates the wallet if it
+    /// doesn't exist yet and is a no-op (storage untouched) if it does. Because
+    /// the wallet id is derived from it, every relay target provably runs
+    /// allowlisted code. Universal state inits must therefore carry code.
     ///
-    /// `msg` and `proof` are forwarded as they are: the wallet contract
-    /// verifies the signature. Attach enough gas for the wallet's work (the
-    /// connectors attach 300 TGas).
+    /// `args` are the `w_execute_signed` arguments (JSON `{"msg": …, "proof":
+    /// …}`, base64-encoded here) and are forwarded byte for byte, so the
+    /// signed message reaches the wallet exactly as the client built it. The
+    /// wallet contract verifies the signature. Attach enough gas for the
+    /// wallet's work (the connectors attach 300 TGas). Returns the wallet's
+    /// result.
     pub fn relay_execute_signed(
         &mut self,
-        wallet_id: AccountId,
-        msg: serde_json::Value,
-        proof: String,
-        state_init: Option<WalletStateInit>,
+        state_init: WalletStateInit,
+        args: Base64VecU8,
     ) -> Promise {
-        require!(
-            is_wallet_account(&wallet_id),
-            "Relays only go to deterministic (0s…) or universal (0u…) wallet accounts"
-        );
-        let mut promise = Promise::new(wallet_id.clone());
-        match state_init {
-            None => {}
-            Some(WalletStateInit::Deterministic(state_init)) => {
-                let derived = self.check_deterministic(&state_init);
-                require!(
-                    derived == wallet_id,
-                    "state_init does not derive to wallet_id"
-                );
-                promise = promise.state_init(state_init, NearToken::from_yoctonear(0));
+        require_own_key();
+        let (wallet_id, promise) = match state_init {
+            WalletStateInit::Deterministic(state_init) => {
+                let wallet_id = self.check_deterministic(&state_init);
+                let promise = Promise::new(wallet_id.clone())
+                    .state_init(state_init, NearToken::from_yoctonear(0));
+                (wallet_id, promise)
             }
-            Some(WalletStateInit::Universal(state_init)) => {
-                let (derived, decoded) = decode_universal(&state_init);
-                require!(
-                    derived == wallet_id,
-                    "state_init does not derive to wallet_id"
-                );
+            WalletStateInit::Universal(state_init) => {
+                let (wallet_id, decoded) = decode_universal(&state_init);
                 let code = decoded.code().unwrap_or_else(|| {
                     env::panic_str("A wallet's universal state init needs contract code")
                 });
                 self.require_allowed_code(code);
-                promise = promise.universal_state_init(state_init, NearToken::from_yoctonear(0));
+                let promise = Promise::new(wallet_id.clone())
+                    .universal_state_init(state_init, NearToken::from_yoctonear(0));
+                (wallet_id, promise)
             }
-        }
+        };
         self.relays.take(
             self.window_ns,
             self.max_relays_per_window,
@@ -265,9 +270,7 @@ impl Contract {
         emit("relay_requested", "w_execute_signed", &wallet_id);
         promise.function_call_weight(
             "w_execute_signed".to_string(),
-            serde_json::json!({ "msg": msg, "proof": proof })
-                .to_string()
-                .into_bytes(),
+            args.0,
             NearToken::from_yoctonear(1),
             Gas::from_gas(0),
             GasWeight(1),
@@ -279,6 +282,7 @@ impl Contract {
     pub fn get_config(&self) -> Config {
         Config {
             owner_id: self.owner_id.clone(),
+            pending_owner_id: self.pending_owner_id.clone(),
             registrar_id: self.registrar_id.clone(),
             allowed_codes: self.allowed_codes.clone(),
             window_secs: U64(self.window_ns / 1_000_000_000),
@@ -299,6 +303,7 @@ impl Contract {
     pub fn add_allowed_code(&mut self, code: GlobalContractId) {
         self.assert_owner();
         if !self.allowed_codes.contains(&code) {
+            emit_admin("allowed_code_added", serde_json::json!({ "code": code }));
             self.allowed_codes.push(code);
         }
     }
@@ -306,7 +311,10 @@ impl Contract {
     #[payable]
     pub fn remove_allowed_code(&mut self, code: GlobalContractId) {
         self.assert_owner();
-        self.allowed_codes.retain(|c| c != &code);
+        if self.allowed_codes.contains(&code) {
+            emit_admin("allowed_code_removed", serde_json::json!({ "code": code }));
+            self.allowed_codes.retain(|c| c != &code);
+        }
     }
 
     #[payable]
@@ -321,12 +329,40 @@ impl Contract {
         self.window_ns = secs_to_ns(window_secs.0);
         self.max_accounts_per_window = max_accounts_per_window;
         self.max_relays_per_window = max_relays_per_window;
+        emit_admin(
+            "rate_limits_set",
+            serde_json::json!({
+                "window_secs": window_secs,
+                "max_accounts_per_window": max_accounts_per_window,
+                "max_relays_per_window": max_relays_per_window,
+            }),
+        );
     }
 
+    /// First step of an ownership transfer: `owner_id` becomes owner once it
+    /// calls `accept_owner`. Proposing again replaces the pending owner.
     #[payable]
-    pub fn set_owner(&mut self, owner_id: AccountId) {
+    pub fn propose_owner(&mut self, owner_id: AccountId) {
         self.assert_owner();
-        self.owner_id = owner_id;
+        emit_admin(
+            "owner_proposed",
+            serde_json::json!({ "owner_id": owner_id }),
+        );
+        self.pending_owner_id = Some(owner_id);
+    }
+
+    /// Second step: the proposed owner accepts (with 1 yoctoNEAR).
+    #[payable]
+    pub fn accept_owner(&mut self) {
+        assert_one_yocto();
+        let caller = env::predecessor_account_id();
+        require!(
+            self.pending_owner_id.as_ref() == Some(&caller),
+            "Only the proposed owner can accept"
+        );
+        emit_admin("owner_changed", serde_json::json!({ "owner_id": caller }));
+        self.owner_id = caller;
+        self.pending_owner_id = None;
     }
 }
 
@@ -384,17 +420,27 @@ fn is_implicit(account_id: &AccountId) -> bool {
         || (id.len() == 42 && id.starts_with("0x") && is_lower_hex(&id[2..]))
 }
 
-/// `0s` + 40 hex (NEP-616) or `0u` + 52 base32 characters (NEP-655).
-fn is_wallet_account(account_id: &AccountId) -> bool {
-    let id = account_id.as_str();
-    (id.len() == 42 && id.starts_with("0s") && is_lower_hex(&id[2..]))
-        || (id.len() == 54
-            && id.starts_with("0u")
-            && id[2..].bytes().all(|b| b.is_ascii_alphanumeric()))
+/// The public methods are meant to be called with the sponsor's own access
+/// keys (the public function-call key, or the operator's full-access key).
+fn require_own_key() {
+    require!(
+        env::predecessor_account_id() == env::current_account_id(),
+        "Only callable with the sponsor account's own access keys"
+    );
 }
 
 fn secs_to_ns(secs: u64) -> u64 {
     secs.saturating_mul(1_000_000_000)
+}
+
+fn emit_admin(event: &str, data: serde_json::Value) {
+    let event = serde_json::json!({
+        "standard": EVENT_STANDARD,
+        "version": EVENT_VERSION,
+        "event": event,
+        "data": [data],
+    });
+    env::log_str(&format!("EVENT_JSON:{event}"));
 }
 
 fn emit(event: &str, kind: &str, account_id: &AccountId) {

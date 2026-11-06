@@ -40,6 +40,13 @@ impl Registrar {
     #[payable]
     pub fn w_execute_signed(&mut self, msg: serde_json::Value, proof: String) {
         assert_one_yocto();
-        env::log_str(&format!("w_execute_signed proof={proof} msg={msg}"));
+        // Records the last proof under "pk" (a key the tests also seed via
+        // state init) and logs the previous value, so tests can tell whether a
+        // repeated state init reset the account's storage.
+        let prev = env::storage_read(b"pk").map(|v| String::from_utf8_lossy(&v).into_owned());
+        env::storage_write(b"pk", proof.as_bytes());
+        env::log_str(&format!(
+            "w_execute_signed proof={proof} prev_pk={prev:?} msg={msg}"
+        ));
     }
 }
