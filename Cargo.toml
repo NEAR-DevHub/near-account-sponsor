@@ -4,7 +4,7 @@ description = "Sponsors creation of NEAR accounts (named, implicit, NEP-616 dete
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/frol-ai/near-account-sponsor"
+repository = "https://github.com/NEAR-DevHub/near-account-sponsor"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
